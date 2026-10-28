@@ -196,7 +196,8 @@ class TileSchedulerProtocol(Protocol):
         """Producer-side prefetch of next work tile (no-op for static schedulers).
 
         For dynamic schedulers: producer acquire (+ issue CLC query) + producer state advance.
-        Only called by the scheduler warp.
+        Only called by the single producer warp (CLC: the scheduler warp; dynamic: the first
+        load warp).
         """
         ...
 
@@ -1110,10 +1111,23 @@ class VarlenDecoder(ParamsBase):
             m_blocks_in_group = cute.arch.shuffle_sync(cumulative, cute.arch.WARP_SIZE - 1)
             group_end_tile = m_blocks_in_group * self.num_head + group_start_tile
 
+            # Padded cu_seqlens repeat the last offset; once a group starts there, every
+            # remaining batch is empty and the tile is invalid without scanning the tail.
+            stop_at_padding = const_expr(
+                self.mCuSeqlensQ is not None
+                and self.mSeqUsedQ is None
+                and self.virtual_batch_idx_ptr is None
+            )
             batch_idx = bidb_start
             while group_end_tile <= next_tile_idx:
                 batch_idx += cute.arch.WARP_SIZE - 1
-                if batch_idx >= self.num_batch:
+                at_padding = Boolean(False)
+                if const_expr(stop_at_padding):
+                    if batch_idx < self.num_batch:
+                        at_padding = (
+                            self.mCuSeqlensQ[batch_idx] == self.mCuSeqlensQ[self.num_batch]
+                        )
+                if batch_idx >= self.num_batch or at_padding:
                     batch_idx = Int32(self.num_batch)
                     group_end_tile = next_tile_idx + 1
                 else:
@@ -1428,7 +1442,23 @@ class SingleTileVarlenScheduler:
         return scheduler
 
 
+# DynamicPersistentVarlenScheduler semaphore: the low bits count claimed tiles (all tiles handed out
+# in one launch), the high bits count finished CTAs (at most the grid, about the SM count).
+SEMAPHORE_CLAIM_BITS = 24
+SEMAPHORE_FINISHED_BITS = 32 - SEMAPHORE_CLAIM_BITS
+SEMAPHORE_CLAIM_MASK = (1 << SEMAPHORE_CLAIM_BITS) - 1
+SEMAPHORE_MAX_CTAS = (1 << SEMAPHORE_FINISHED_BITS) - 1
+
+
 class DynamicPersistentVarlenScheduler:
+    """Persistent varlen scheduler: a grid of at most SEMAPHORE_MAX_CTAS CTAs claims tiles from
+    ``tile_count_semaphore`` with an atomic add, after each CTA's first tile (its block index).
+
+    The semaphore must be zero at launch and belong to one in-flight launch at a time; the last
+    CTA to finish resets it (see ``producer_tail``), so launches ordered on one stream can reuse it
+    without a host-side reset.
+    """
+
     @dataclass
     class Params(ParamsBase):
         total_q: Int32
@@ -1517,8 +1547,9 @@ class DynamicPersistentVarlenScheduler:
         ) // d.tile_shape_mn[0]
         total_blocks = total_blocks_max * d.num_head * d.num_splits
         hardware_info = HardwareInfo()
-        sm_count = (
-            hardware_info.get_device_multiprocessor_count() * params.persistent_cta_multiplier
+        sm_count = min(
+            hardware_info.get_device_multiprocessor_count() * params.persistent_cta_multiplier,
+            SEMAPHORE_MAX_CTAS,
         )
         return (cutlass.min(sm_count, total_blocks), Int32(1), Int32(1))
 
@@ -1552,13 +1583,17 @@ class DynamicPersistentVarlenScheduler:
 
     @cute.jit
     def prefetch_next_work(self, *, loc=None, ip=None):
+        """Claim the next tile and publish it to the CTA's warps.
+
+        The first load warp calls this after issuing the current tile's loads. Claiming only once
+        the one-slot pipeline is free keeps a CTA at most one tile ahead.
+        """
         ctx = self._ctx
+        ctx.producer_acquire()
         next_tile_idx = Int32(0)
         if cute.arch.lane_idx() == 0:
-            next_tile_idx = cute.arch.grid_dim()[0] + utils.atomic_add_i32(
-                1,
-                self.params.tile_count_semaphore,
-            )
+            claimed = utils.atomic_add_i32(1, self.params.tile_count_semaphore)
+            next_tile_idx = cute.arch.grid_dim()[0] + (claimed & SEMAPHORE_CLAIM_MASK)
         next_tile_idx = cute.arch.shuffle_sync(next_tile_idx, 0)
         work_info, new_group_start_tile = self.get_current_work(
             next_tile_idx, self._bidb_start, self._group_start_tile
@@ -1567,7 +1602,6 @@ class DynamicPersistentVarlenScheduler:
         # group instead of restarting at batch 0.
         self._bidb_start = Int32(work_info.tile_idx[2])
         self._group_start_tile = new_group_start_tile
-        ctx.producer_acquire()
         with cute.arch.elect_one():
             block, head_idx, batch_idx, split_idx = work_info.tile_idx
             ctx.write_work_info(block, head_idx, batch_idx, split_idx)
@@ -1595,8 +1629,25 @@ class DynamicPersistentVarlenScheduler:
         self._group_start_tile = new_group_start_tile
         return work_info
 
+    @cute.jit
     def producer_tail(self, *, loc=None, ip=None):
+        """Report this CTA finished; the last CTA resets the semaphore for the next launch.
+
+        Each CTA calls this once, after its last claim (including CTAs whose first tile is
+        invalid). Claims and the report come from the same thread to the same address, so the CTA
+        that sees ``grid - 1`` others finished observes every claim and can zero the semaphore. A
+        finished count of at least ``grid`` means the semaphore was not zero at launch or is shared
+        with a concurrent launch, so tiles may have been skipped: trap instead.
+        """
         self._ctx.producer_tail(loc=loc, ip=ip)
+        if cute.arch.lane_idx() == 0:
+            finished = Int32(1 << SEMAPHORE_CLAIM_BITS)
+            old = utils.atomic_add_i32(finished, self.params.tile_count_semaphore)
+            num_finished = (old >> SEMAPHORE_CLAIM_BITS) & SEMAPHORE_MAX_CTAS
+            if num_finished == cute.arch.grid_dim()[0] - 1:
+                utils.atomic_add_i32(-(old + finished), self.params.tile_count_semaphore)
+            elif num_finished >= cute.arch.grid_dim()[0]:
+                cute.arch.inline_ptx("trap;", read_only_args=[])
 
     def __extract_mlir_values__(self):
         values, self._values_pos = [], []

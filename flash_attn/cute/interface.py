@@ -56,6 +56,7 @@ from flash_attn.cute.flash_bwd_postprocess import (
 from flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
 from flash_attn.cute.flash_fwd_mla_sm100 import FlashAttentionMLAForwardSm100
 from flash_attn.cute.prepare_scheduler import FlashPrepareScheduler, SchedulerMetadataTensorsTorch
+from flash_attn.cute.tile_scheduler import SEMAPHORE_CLAIM_BITS
 from flash_attn.cute.cu_blocks_kernel import CuSeqlensToBlocksKernel, CuBlocksToBatchKernel
 from flash_attn.cute.flash_fwd_mla_1cta_sm100 import FlashAttentionMLAForward1CtaSm100
 from flash_attn.cute.flash_fwd_mla_1cta_kb64_sm100 import FlashAttentionMLAForward1CtaKb64Sm100
@@ -675,6 +676,20 @@ def _mla_fwd_plan(
 
 
 
+def _dynamic_varlen_max_tiles(
+    total_q: int, batch_size: int, m_tile: int, num_head: int, num_head_kv: int, pack_gqa: bool,
+    num_splits: int,
+) -> int:
+    """Upper bound on the tiles DynamicPersistentVarlenScheduler can claim, in the kernel's
+    geometry: M tiles of ``q_stage * tile_m`` rows over packed rows (PackGQA) per scheduled head.
+    Each nonempty request adds at most one partial tile and needs at least one of the total_q
+    rows, so padded request slots beyond total_q add none."""
+    rows_per_token = num_head // num_head_kv if pack_gqa else 1
+    heads = num_head_kv if pack_gqa else num_head
+    requests = min(batch_size, total_q)
+    return (total_q * rows_per_token // m_tile + requests + 1) * heads * max(num_splits, 1)
+
+
 def _flash_attn_fwd(
     q: Optional[torch.Tensor],
     k: Optional[torch.Tensor],
@@ -1256,7 +1271,6 @@ def _flash_attn_fwd(
         p = row_max = o_lo = None
 
 
-    reuse_scheduler_metadata = scheduler_metadata is not None
     is_varlen_q = cu_seqlens_q is not None or seqused_q is not None
     cluster_shape_m = 2 if use_2cta_instrs else 1
     if qv is not None:
@@ -1315,6 +1329,15 @@ def _flash_attn_fwd(
         ), "these scheduler metadata tensors must have shape (batch_size,)"
         if tile_count_semaphore is not None:
             assert tile_count_semaphore.shape == (1,), "semaphore must have size 1"
+            assert tile_count_semaphore.dtype == torch.int32, "semaphore must be int32"
+            assert tile_count_semaphore.device == q.device, "semaphore must be on q's device"
+        if tile_count_semaphore is not None and arch // 10 in [10, 11] and is_varlen_q:
+            max_tiles = _dynamic_varlen_max_tiles(
+                total_q, batch_size, q_stage * tile_m, num_head, num_head_kv, pack_gqa, num_splits
+            )
+            assert max_tiles < 1 << SEMAPHORE_CLAIM_BITS, (
+                f"dynamic varlen scheduler supports < {1 << SEMAPHORE_CLAIM_BITS} tiles, got up to {max_tiles}"
+            )
     else:
         num_m_blocks = None
         num_splits_dynamic = None
@@ -1993,11 +2016,6 @@ def _flash_attn_fwd(
         )
         if lse is not None and qv is not None:
             lse.copy_(lse_combine)
-    if reuse_scheduler_metadata and tile_count_semaphore is not None:
-        # TODO: pass tile_count_semaphore to the combine kernel and zero it there when
-        # is_split_kv (using CTA 0, since a later CTA may have exited prematurely), so
-        # that this host-side zeroing is only needed when is_split_kv=False.
-        tile_count_semaphore.zero_()
     return out, lse, p, row_max, o_lo
 
 
@@ -5075,7 +5093,9 @@ def get_scheduler_metadata(
         SchedulerMetadataTensorsTorch, a named tuple including:
         - num_splits_dynamic_ptr: per-batch num_splits
         - num_nheads_in_l2_ptr: used for head swizzle to avoid l2 cache thrashing
-        - tile_count_semaphore: the global semaphore used by DynamicPersistentVarlenScheduler atomic incrementation
+        - tile_count_semaphore: the global semaphore used by DynamicPersistentVarlenScheduler atomic
+            incrementation. The kernel resets it at exit, so metadata can be reused across launches
+            ordered on one stream, but not by launches that may run concurrently.
         - cu_total_m_blocks: cumsum tensor counting total m_blocks, used for binary batch search with large batch_size
         - cu_total_splits_m_blocks: complementary cumsum tensor used for binary batch search and to
             extract dynamic num splits in the absense of num_splits_dynamic_ptr
